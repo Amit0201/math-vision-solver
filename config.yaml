@@ -1,0 +1,131 @@
+# config.yaml — Central configuration for the entire project
+
+# ─── Project ───
+project:
+  name: "AI Math Vision Solver"
+  version: "1.0.0"
+  phase: 1
+
+# ─── Paths ───
+paths:
+  data_raw: "data/raw"
+  data_processed: "data/processed"
+  datasets: "data/datasets"
+  models: "models"
+  logs: "logs"
+
+# ─── Data ───
+data:
+  # Which datasets to use
+  sources:
+    - name: "emnist"
+      enabled: true
+      split: "balanced"
+      auto_download: true
+
+    - name: "hasyv2"
+      enabled: true
+      path: "data/datasets/HASYv2"
+      url: "https://zenodo.org/record/259444/files/HASYv2.tar.bz2"
+
+    - name: "kaggle_math_symbols"
+      enabled: false  # Requires Kaggle API key
+      path: "data/datasets/kaggle_math_symbols"
+
+    - name: "custom_synthetic"
+      enabled: true
+      path: "data/datasets/custom_synthetic"
+      samples_per_class: 1000
+
+  # Symbol classes for Phase 1 (25 classes)
+  symbol_classes:
+    - "0"
+    - "1"
+    - "2"
+    - "3"
+    - "4"
+    - "5"
+    - "6"
+    - "7"
+    - "8"
+    - "9"
+    - "+"
+    - "-"
+    - "*"
+    - "/"
+    - "="
+    - "("
+    - ")"
+    - "^"
+    - "x"
+    - "y"
+    - "z"
+    - "sqrt"
+    - "pi"
+    - "."
+    - "frac"
+
+  # Train/Val/Test split ratios
+  split_ratios:
+    train: 0.8
+    val: 0.1
+    test: 0.1
+
+# ─── Image Preprocessing ───
+preprocessing:
+  input_size: [256, 64]        # Full equation image
+  symbol_size: [45, 45]        # Individual symbol
+  binary_threshold_block: 11
+  binary_threshold_c: 2
+  min_contour_area: 50
+  deskew_enabled: true
+
+# ─── Model ───
+model:
+  # Symbol classifier (CNN)
+  symbol_cnn:
+    num_classes: 25
+    input_channels: 1
+    input_size: 45
+
+  # Equation recognizer (Encoder-Decoder)
+  equation_recognizer:
+    encoder_dim: 256
+    decoder_hidden: 256
+    embed_dim: 128
+    max_seq_length: 50
+    vocab_size: 30  # 25 symbols + START, END, PAD, UNK, SPACE
+
+# ─── Training ───
+training:
+  batch_size: 64
+  epochs: 50
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  lr_scheduler:
+    type: "reduce_on_plateau"
+    patience: 5
+    factor: 0.5
+  gradient_clip: 5.0
+  early_stopping_patience: 10
+  device: "auto"  # auto, cuda, cpu
+
+# ─── Augmentation ───
+augmentation:
+  rotation_degrees: 15
+  translate: [0.1, 0.1]
+  scale: [0.9, 1.1]
+  shear: 10
+  perspective_distortion: 0.2
+  gaussian_blur_kernel: 3
+  random_erasing_prob: 0.2
+  elastic_alpha: 8
+  elastic_sigma: 3
+
+# ─── Web App ───
+app:
+  title: "🧠 AI Math Solver"
+  host: "0.0.0.0"
+  port: 8501
+  max_upload_size_mb: 10
+  supported_formats: ["png", "jpg", "jpeg", "bmp"]

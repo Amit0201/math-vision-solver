@@ -1,0 +1,83 @@
+# .gitignore
+
+# ═══════════════════════════════════════
+#  Python
+# ═══════════════════════════════════════
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# ═══════════════════════════════════════
+#  Virtual Environment
+# ═══════════════════════════════════════
+.venv/
+venv/
+ENV/
+env/
+
+# ═══════════════════════════════════════
+#  IDE (PyCharm / VSCode)
+# ═══════════════════════════════════════
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# ═══════════════════════════════════════
+#  Data (too large for GitHub)
+# ═══════════════════════════════════════
+data/raw/
+data/processed/
+data/datasets/
+
+# Keep the folder structure but not the data
+!data/
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# ═══════════════════════════════════════
+#  Trained Models (too large for GitHub)
+# ═══════════════════════════════════════
+models/*.pth
+models/*.pt
+models/*.h5
+models/*.onnx
+
+# Keep the folder but not model files
+!models/
+!models/.gitkeep
+
+# ═══════════════════════════════════════
+#  Logs
+# ═══════════════════════════════════════
+logs/
+*.log
+
+# ═══════════════════════════════════════
+#  Jupyter Notebooks Checkpoints
+# ═══════════════════════════════════════
+.ipynb_checkpoints/
+
+# ═══════════════════════════════════════
+#  OS Files
+# ═══════════════════════════════════════
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ═══════════════════════════════════════
+#  Misc
+# ═══════════════════════════════════════
+*.zip
+*.tar.gz
+*.tar.bz2
+*.rar

@@ -1,0 +1,721 @@
+# scripts/combine_datasets.py
+
+"""
+MASTER SCRIPT: Combines all data sources into one unified dataset.
+
+Run this AFTER download_data.py and BEFORE train.py
+
+Usage:
+    python scripts/combine_datasets.py
+    python scripts/combine_datasets.py --max-per-class 5000
+    python scripts/combine_datasets.py --sources synthetic,emnist
+"""
+
+import os
+import sys
+import cv2
+import csv
+import json
+import shutil
+import struct
+import gzip
+import argparse
+import numpy as np
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+from collections import defaultdict, Counter
+import random
+
+sys.path.append(str(Path(__file__).parent.parent / 'src'))
+from src.utils.helpers import setup_logger, timer, set_seed
+
+logger = setup_logger('combine_data', log_file='logs/combine_data.log')
+
+# ═══════════════════════════════════════════════════
+#  CONFIGURATION
+# ═══════════════════════════════════════════════════
+
+# Our 25 target classes
+TARGET_CLASSES = [
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    'plus', 'minus', 'multiply', 'divide', 'equals',
+    'lparen', 'rparen', 'power',
+    'x', 'y', 'z',
+    'sqrt', 'pi', 'decimal', 'frac'
+]
+
+# Unified image size
+TARGET_SIZE = (45, 45)
+
+# Split ratios
+TRAIN_RATIO = 0.80
+VAL_RATIO = 0.10
+TEST_RATIO = 0.10
+
+
+class DataCombiner:
+    """
+    Combines multiple data sources into one unified dataset.
+
+    Each source has its own adapter that:
+      1. Reads images from the source's native format
+      2. Maps source classes → our 25 target classes
+      3. Resizes all images to 45×45 grayscale
+      4. Saves to data/processed/{split}/{class_name}/
+    """
+
+    def __init__(self, raw_dir: str = 'data/raw',
+                 output_dir: str = 'data/processed',
+                 max_per_class: Optional[int] = None):
+
+        self.raw_dir = Path(raw_dir)
+        self.output_dir = Path(output_dir)
+        self.max_per_class = max_per_class
+        self.stats = defaultdict(lambda: defaultdict(int))
+
+        set_seed(42)
+
+    # ═══════════════════════════════════════════
+    #  MAIN ENTRY POINT
+    # ═══════════════════════════════════════════
+
+    @timer
+    def combine_all(self, sources: Optional[List[str]] = None):
+        """
+        Main method: Combine all (or selected) sources.
+
+        Args:
+            sources: List of source names to include.
+                     None = all available sources.
+                     Example: ['synthetic', 'emnist']
+        """
+        print("=" * 70)
+        print("📦 DATASET COMBINER — Merging All Sources")
+        print("=" * 70)
+
+        # Step 1: Create output directories
+        self._create_output_dirs()
+
+        # Step 2: Collect images from each source
+        all_images = defaultdict(list)
+        # all_images = { 'plus': [(img_array, 'emnist'), (img_array, 'kaggle'), ...], ... }
+
+        available_sources = {
+            'synthetic': self._load_synthetic,
+            'emnist': self._load_emnist,
+            'hasyv2': self._load_hasyv2,
+            'kaggle': self._load_kaggle,
+        }
+
+        for source_name, loader_func in available_sources.items():
+            if sources and source_name not in sources:
+                logger.info(f"⏭️  Skipping {source_name} (not in selected sources)")
+                continue
+
+            print(f"\n{'─' * 70}")
+            print(f"📥 Loading: {source_name.upper()}")
+            print(f"{'─' * 70}")
+
+            try:
+                source_images = loader_func()
+                # source_images = { 'class_name': [img1, img2, ...] }
+
+                for class_name, images in source_images.items():
+                    for img in images:
+                        all_images[class_name].append((img, source_name))
+
+                    self.stats[source_name][class_name] = len(images)
+                    logger.info(f"  {class_name:15s}: {len(images):>6,} images")
+
+                total = sum(len(v) for v in source_images.values())
+                print(f"  ✅ {source_name}: {total:,} images loaded")
+
+            except Exception as e:
+                logger.error(f"  ❌ Failed to load {source_name}: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # Step 3: Balance and limit per class
+        if self.max_per_class:
+            all_images = self._balance_classes(all_images)
+
+        # Step 4: Split into train/val/test
+        print(f"\n{'─' * 70}")
+        print(f"✂️  Splitting into train/val/test")
+        print(f"{'─' * 70}")
+        self._split_and_save(all_images)
+
+        # Step 5: Save statistics
+        self._save_stats()
+
+        print(f"\n{'=' * 70}")
+        print(f"✅ DATASET COMBINATION COMPLETE")
+        print(f"   Output: {self.output_dir}")
+        print(f"{'=' * 70}")
+
+    # ═══════════════════════════════════════════
+    #  SOURCE 1: SYNTHETIC DATA
+    # ═══════════════════════════════════════════
+
+    def _load_synthetic(self) -> Dict[str, List[np.ndarray]]:
+        """
+        Load synthetic data generated by create_custom_dataset.py
+
+        Expected structure:
+            data/raw/synthetic/train/{class_name}/*.png
+        """
+        synthetic_dir = self.raw_dir / 'synthetic'
+        images = defaultdict(list)
+
+        if not synthetic_dir.exists():
+            logger.warning(f"Synthetic data not found at {synthetic_dir}")
+            logger.info("Run first: python scripts/create_custom_dataset.py")
+            return images
+
+        # Load from all splits (we'll re-split later)
+        for split in ['train', 'val', 'test']:
+            split_dir = synthetic_dir / split
+            if not split_dir.exists():
+                continue
+
+            for class_dir in sorted(split_dir.iterdir()):
+                if not class_dir.is_dir():
+                    continue
+
+                class_name = class_dir.name
+                if class_name not in TARGET_CLASSES:
+                    continue
+
+                for img_path in class_dir.glob('*.png'):
+                    img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+                    if img is not None:
+                        img = cv2.resize(img, TARGET_SIZE)
+                        images[class_name].append(img)
+
+        return images
+
+    # ═══════════════════════════════════════════
+    #  SOURCE 2: EMNIST
+    # ═══════════════════════════════════════════
+
+    def _load_emnist(self) -> Dict[str, List[np.ndarray]]:
+        """
+        Load EMNIST balanced dataset.
+
+        EMNIST balanced has 47 classes:
+          0-9   : digits
+          10-35 : uppercase A-Z
+          36-46 : some lowercase letters (merged with uppercase)
+
+        We only extract: digits (0-9) and letters x(33), y(34), z(35)
+        """
+        images = defaultdict(list)
+
+        # Try loading via torchvision first
+        try:
+            return self._load_emnist_torchvision()
+        except Exception as e:
+            logger.info(f"Torchvision loading failed ({e}), trying raw files...")
+
+        # Fallback: Load from raw binary files
+        emnist_dir = self.raw_dir / 'emnist' / 'EMNIST' / 'raw'
+
+        if not emnist_dir.exists():
+            logger.warning(f"EMNIST not found at {emnist_dir}")
+            return images
+
+        # Load training data
+        images_array, labels_array = self._read_emnist_binary(
+            str(emnist_dir / 'emnist-balanced-train-images-idx3-ubyte.gz'),
+            str(emnist_dir / 'emnist-balanced-train-labels-idx1-ubyte.gz')
+        )
+
+        if images_array is None:
+            return images
+
+        # EMNIST class mapping → our classes
+        emnist_to_ours = {
+            0: '0', 1: '1', 2: '2', 3: '3', 4: '4',
+            5: '5', 6: '6', 7: '7', 8: '8', 9: '9',
+            33: 'x',  # EMNIST class 33 = 'X' (we use as 'x')
+            34: 'y',  # EMNIST class 34 = 'Y'
+            35: 'z',  # EMNIST class 35 = 'Z'
+        }
+
+        for idx in range(len(labels_array)):
+            label = int(labels_array[idx])
+
+            if label in emnist_to_ours:
+                class_name = emnist_to_ours[label]
+                img = images_array[idx].reshape(28, 28)
+
+                # EMNIST images need transpose (they're rotated)
+                img = np.transpose(img)
+                img = np.flip(img, axis=1)
+
+                # Resize to target
+                img = cv2.resize(img, TARGET_SIZE)
+
+                # Invert if needed (EMNIST: white on black → black on white)
+                if img.mean() < 128:
+                    img = 255 - img
+
+                images[class_name].append(img)
+
+        return images
+
+    def _load_emnist_torchvision(self) -> Dict[str, List[np.ndarray]]:
+        """Load EMNIST using torchvision (preferred method)."""
+        from torchvision.datasets import EMNIST
+
+        images = defaultdict(list)
+        emnist_dir = self.raw_dir / 'emnist'
+
+        dataset = EMNIST(
+            root=str(emnist_dir),
+            split='balanced',
+            train=True,
+            download=True  # Downloads if not present
+        )
+
+        # EMNIST balanced class mapping
+        # Classes 0-9 = digits, 10-35 = A-Z, 36-46 = a-k (merged)
+        emnist_to_ours = {
+            0: '0', 1: '1', 2: '2', 3: '3', 4: '4',
+            5: '5', 6: '6', 7: '7', 8: '8', 9: '9',
+            33: 'x', 34: 'y', 35: 'z',
+        }
+
+        logger.info(f"Processing {len(dataset)} EMNIST samples...")
+
+        for idx in range(len(dataset)):
+            img, label = dataset[idx]
+            label = int(label)
+
+            if label in emnist_to_ours:
+                class_name = emnist_to_ours[label]
+
+                # Convert PIL image to numpy
+                img_np = np.array(img)
+
+                # Resize
+                img_np = cv2.resize(img_np, TARGET_SIZE)
+
+                # Ensure white background, dark foreground
+                if img_np.mean() < 128:
+                    img_np = 255 - img_np
+
+                images[class_name].append(img_np)
+
+        return images
+
+    def _read_emnist_binary(self, images_path: str,
+                            labels_path: str) -> Tuple:
+        """Read EMNIST binary format (IDX)."""
+        try:
+            # Read labels
+            with gzip.open(labels_path, 'rb') as f:
+                magic, num = struct.unpack('>II', f.read(8))
+                labels = np.frombuffer(f.read(), dtype=np.uint8)
+
+            # Read images
+            with gzip.open(images_path, 'rb') as f:
+                magic, num, rows, cols = struct.unpack('>IIII', f.read(16))
+                images = np.frombuffer(f.read(), dtype=np.uint8)
+                images = images.reshape(num, rows * cols)
+
+            return images, labels
+
+        except Exception as e:
+            logger.error(f"Failed to read EMNIST binary: {e}")
+            return None, None
+
+    # ═══════════════════════════════════════════
+    #  SOURCE 3: HASYv2
+    # ═══════════════════════════════════════════
+
+    def _load_hasyv2(self) -> Dict[str, List[np.ndarray]]:
+        """
+        Load HASYv2 dataset using its CSV label file.
+
+        HASYv2 has 369 classes with LaTeX names.
+        We map relevant ones to our 25 classes.
+
+        CSV format:
+            path, symbol_id, latex, user_id
+            hasy-data/v2-00000.png, 31, A, 1234
+        """
+        images = defaultdict(list)
+        hasy_dir = self.raw_dir / 'hasyv2'
+        labels_csv = hasy_dir / 'hasy-data-labels.csv'
+
+        if not labels_csv.exists():
+            logger.warning(f"HASYv2 labels not found at {labels_csv}")
+            return images
+
+        # HASYv2 LaTeX name → our class name
+        hasyv2_mapping = {
+            # Digits
+            '0': '0', '1': '1', '2': '2', '3': '3', '4': '4',
+            '5': '5', '6': '6', '7': '7', '8': '8', '9': '9',
+            # Operators
+            '+': 'plus', '-': 'minus',
+            '\\times': 'multiply', '\\cdot': 'multiply',
+            '\\div': 'divide',
+            '=': 'equals',
+            # Brackets
+            '(': 'lparen', ')': 'rparen',
+            '\\{': 'lparen', '\\}': 'rparen',  # Map braces too
+            # Variables
+            'x': 'x', 'X': 'x',
+            'y': 'y', 'Y': 'y',
+            'z': 'z', 'Z': 'z',
+            # Special
+            '\\sqrt': 'sqrt', '\\sqrt{}': 'sqrt',
+            '\\pi': 'pi',
+            '.': 'decimal',
+            '\\frac': 'frac',
+            # Power (hat/caret)
+            '\\hat': 'power', '\\^': 'power',
+        }
+
+        logger.info(f"Reading HASYv2 CSV from {labels_csv}...")
+
+        with open(str(labels_csv), 'r') as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                latex_name = row.get('latex', '').strip()
+                img_rel_path = row.get('path', '').strip()
+
+                # Check if this symbol maps to one of our classes
+                if latex_name not in hasyv2_mapping:
+                    continue
+
+                class_name = hasyv2_mapping[latex_name]
+                img_path = hasy_dir / img_rel_path
+
+                if not img_path.exists():
+                    continue
+
+                img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    continue
+
+                # HASYv2 images are 32×32, resize to 45×45
+                img = cv2.resize(img, TARGET_SIZE)
+
+                # Ensure consistent contrast (white bg, dark fg)
+                if img.mean() < 128:
+                    img = 255 - img
+
+                images[class_name].append(img)
+
+        return images
+
+    # ═══════════════════════════════════════════
+    #  SOURCE 4: KAGGLE MATH SYMBOLS
+    # ═══════════════════════════════════════════
+
+    def _load_kaggle(self) -> Dict[str, List[np.ndarray]]:
+        """
+        Load Kaggle Handwritten Math Symbols dataset.
+
+        Expected structure:
+            data/raw/kaggle/dataset/{class_folder}/*.png
+
+        Class folders: 0, 1, ..., 9, add, sub, mul, div, lbracket, rbracket
+        """
+        images = defaultdict(list)
+        kaggle_dir = self.raw_dir / 'kaggle'
+
+        if not kaggle_dir.exists():
+            logger.warning(f"Kaggle data not found at {kaggle_dir}")
+            logger.info("Download from: https://www.kaggle.com/datasets/"
+                        "sagyamthapa/handwritten-math-symbols")
+            return images
+
+        # Find the actual data folder (might be nested)
+        data_dir = None
+        for candidate in [kaggle_dir / 'dataset',
+                          kaggle_dir / 'train',
+                          kaggle_dir]:
+            if candidate.exists() and any(candidate.iterdir()):
+                data_dir = candidate
+                break
+
+        if data_dir is None:
+            logger.warning("Could not find Kaggle data folder")
+            return images
+
+        # Kaggle folder name → our class name
+        kaggle_mapping = {
+            '0': '0', '1': '1', '2': '2', '3': '3', '4': '4',
+            '5': '5', '6': '6', '7': '7', '8': '8', '9': '9',
+            'add': 'plus',
+            'sub': 'minus',
+            'mul': 'multiply',
+            'div': 'divide',
+            'lbracket': 'lparen',
+            'rbracket': 'rparen',
+        }
+
+        for folder_name, class_name in kaggle_mapping.items():
+            class_dir = data_dir / folder_name
+
+            if not class_dir.exists():
+                logger.debug(f"Kaggle class folder not found: {class_dir}")
+                continue
+
+            for img_path in class_dir.glob('*'):
+                if img_path.suffix.lower() not in ('.png', '.jpg', '.jpeg'):
+                    continue
+
+                img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    continue
+
+                img = cv2.resize(img, TARGET_SIZE)
+
+                if img.mean() < 128:
+                    img = 255 - img
+
+                images[class_name].append(img)
+
+        return images
+
+    # ═══════════════════════════════════════════
+    #  BALANCING & SPLITTING
+    # ═══════════════════════════════════════════
+
+    def _balance_classes(self, all_images: Dict) -> Dict:
+        """
+        Balance classes by capping the maximum per class.
+
+        If max_per_class = 5000:
+          - Classes with > 5000 images: randomly sample 5000
+          - Classes with < 5000 images: keep all (or augment)
+        """
+        print(f"\n⚖️  Balancing classes (max per class: {self.max_per_class})")
+
+        balanced = {}
+        for class_name in TARGET_CLASSES:
+            items = all_images.get(class_name, [])
+
+            if len(items) > self.max_per_class:
+                random.shuffle(items)
+                balanced[class_name] = items[:self.max_per_class]
+                logger.info(f"  {class_name:15s}: {len(items):>6,} → "
+                            f"{self.max_per_class:>6,} (capped)")
+            elif len(items) == 0:
+                logger.warning(f"  {class_name:15s}: ⚠️  NO IMAGES! "
+                               f"This class will be missing.")
+                balanced[class_name] = []
+            else:
+                balanced[class_name] = items
+                logger.info(f"  {class_name:15s}: {len(items):>6,} (kept all)")
+
+        return balanced
+
+    def _split_and_save(self, all_images: Dict):
+        """
+        Split combined images into train/val/test and save to disk.
+        """
+        total_saved = 0
+        split_counts = defaultdict(int)
+
+        for class_name in TARGET_CLASSES:
+            items = all_images.get(class_name, [])
+
+            if not items:
+                logger.warning(f"No images for class '{class_name}', skipping")
+                continue
+
+            # Shuffle
+            random.shuffle(items)
+
+            # Split
+            n = len(items)
+            n_train = int(n * TRAIN_RATIO)
+            n_val = int(n * VAL_RATIO)
+
+            train_items = items[:n_train]
+            val_items = items[n_train:n_train + n_val]
+            test_items = items[n_train + n_val:]
+
+            # Save each split
+            for split_name, split_items in [('train', train_items),
+                                            ('val', val_items),
+                                            ('test', test_items)]:
+                save_dir = self.output_dir / split_name / class_name
+                save_dir.mkdir(parents=True, exist_ok=True)
+
+                for idx, (img, source) in enumerate(split_items):
+                    filename = f"{source}_{class_name}_{idx:06d}.png"
+                    save_path = save_dir / filename
+                    cv2.imwrite(str(save_path), img)
+                    total_saved += 1
+                    split_counts[split_name] += 1
+
+            logger.info(f"  {class_name:15s}: "
+                        f"train={len(train_items):>5,} | "
+                        f"val={len(val_items):>4,} | "
+                        f"test={len(test_items):>4,}")
+
+        print(f"\n📊 Split Summary:")
+        print(f"   Train : {split_counts['train']:>8,} images")
+        print(f"   Val   : {split_counts['val']:>8,} images")
+        print(f"   Test  : {split_counts['test']:>8,} images")
+        print(f"   Total : {total_saved:>8,} images")
+
+    # ═══════════════════════════════════════════
+    #  UTILITIES
+    # ═══════════════════════════════════════════
+
+    def _create_output_dirs(self):
+        """Create output directory structure."""
+        # Clean previous output
+        if self.output_dir.exists():
+            logger.info(f"Cleaning previous output at {self.output_dir}")
+            shutil.rmtree(str(self.output_dir))
+
+        for split in ['train', 'val', 'test']:
+            for class_name in TARGET_CLASSES:
+                (self.output_dir / split / class_name).mkdir(
+                    parents=True, exist_ok=True
+                )
+
+        logger.info(f"✅ Created {3 * len(TARGET_CLASSES)} output directories")
+
+    def _save_stats(self):
+        """Save dataset statistics to JSON."""
+        stats = {
+            'target_classes': TARGET_CLASSES,
+            'num_classes': len(TARGET_CLASSES),
+            'image_size': list(TARGET_SIZE),
+            'split_ratios': {
+                'train': TRAIN_RATIO,
+                'val': VAL_RATIO,
+                'test': TEST_RATIO
+            },
+            'source_stats': {},
+            'per_class_totals': {},
+        }
+
+        # Source stats
+        for source, class_counts in self.stats.items():
+            stats['source_stats'][source] = {
+                'classes': dict(class_counts),
+                'total': sum(class_counts.values()),
+            }
+
+        # Per-class totals
+        for class_name in TARGET_CLASSES:
+            total = 0
+            for source_stats in self.stats.values():
+                total += source_stats.get(class_name, 0)
+            stats['per_class_totals'][class_name] = total
+
+        # Count actual saved files
+        for split in ['train', 'val', 'test']:
+            split_dir = self.output_dir / split
+            if split_dir.exists():
+                count = sum(1 for _ in split_dir.rglob('*.png'))
+                stats[f'{split}_total'] = count
+
+        stats_path = self.output_dir / 'dataset_stats.json'
+        with open(str(stats_path), 'w') as f:
+            json.dump(stats, f, indent=2)
+
+        logger.info(f"📊 Stats saved to {stats_path}")
+
+    def print_final_report(self):
+        """Print detailed report of the combined dataset."""
+        stats_path = self.output_dir / 'dataset_stats.json'
+
+        if not stats_path.exists():
+            print("No stats file found. Run combine_all() first.")
+            return
+
+        with open(str(stats_path), 'r') as f:
+            stats = json.load(f)
+
+        print("\n" + "=" * 70)
+        print("📊 COMBINED DATASET REPORT")
+        print("=" * 70)
+
+        print(f"\n📁 Location: {self.output_dir}")
+        print(f"📐 Image size: {stats['image_size']}")
+        print(f"🏷️  Classes: {stats['num_classes']}")
+
+        print(f"\n{'─' * 70}")
+        print(f"{'Source':<20} {'Images':>10}")
+        print(f"{'─' * 70}")
+
+        for source, source_data in stats.get('source_stats', {}).items():
+            print(f"{source:<20} {source_data['total']:>10,}")
+
+        print(f"{'─' * 70}")
+
+        total = sum(s['total'] for s in stats.get('source_stats', {}).values())
+        print(f"{'TOTAL':<20} {total:>10,}")
+
+        print(f"\n{'─' * 70}")
+        print(f"{'Class':<15} {'Total':>8} {'Train':>8} {'Val':>8} {'Test':>8}")
+        print(f"{'─' * 70}")
+
+        for class_name in TARGET_CLASSES:
+            total = stats['per_class_totals'].get(class_name, 0)
+            train = int(total * TRAIN_RATIO)
+            val = int(total * VAL_RATIO)
+            test = total - train - val
+            print(f"{class_name:<15} {total:>8,} {train:>8,} {val:>8,} {test:>8,}")
+
+        print(f"{'─' * 70}")
+        print(f"{'SPLITS':<15} "
+              f"{'':>8} "
+              f"{stats.get('train_total', 'N/A'):>8} "
+              f"{stats.get('val_total', 'N/A'):>8} "
+              f"{stats.get('test_total', 'N/A'):>8}")
+
+
+# ═══════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Combine all data sources into unified dataset"
+    )
+    parser.add_argument(
+        '--raw-dir', default='data/raw',
+        help='Directory containing raw downloaded data'
+    )
+    parser.add_argument(
+        '--output-dir', default='data/processed',
+        help='Output directory for combined dataset'
+    )
+    parser.add_argument(
+        '--max-per-class', type=int, default=None,
+        help='Maximum images per class (for balancing). '
+             'Default: no limit'
+    )
+    parser.add_argument(
+        '--sources', type=str, default=None,
+        help='Comma-separated list of sources to include. '
+             'Options: synthetic,emnist,hasyv2,kaggle. '
+             'Default: all available'
+    )
+
+    args = parser.parse_args()
+
+    sources = args.sources.split(',') if args.sources else None
+
+    combiner = DataCombiner(
+        raw_dir=args.raw_dir,
+        output_dir=args.output_dir,
+        max_per_class=args.max_per_class
+    )
+
+    combiner.combine_all(sources=sources)
+    combiner.print_final_report()
