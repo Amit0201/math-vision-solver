@@ -1,5 +1,11 @@
 # scripts/create_custom_dataset.py
 
+import sys
+from pathlib import Path
+
+# Add project root to Python path
+sys.path.append(str(Path(__file__).parent.parent))
+
 import cv2
 import numpy as np
 import os
